@@ -40,6 +40,32 @@ def _next_entry(now: int, entry_lead: int) -> tuple[int, int]:
     return target, entry_time
 
 
+def _bootstrap_pending(cfg: dict, db: "Database", notifier: "TelegramNotifier", entry_lead: int) -> dict:
+    """Wait for the next live entry opportunity and open the first trade.
+
+    Loops until a trade is successfully opened so the main pipeline always
+    has a non-None `pending` to anchor its 5-min cadence on. If an attempt
+    fails for any reason, we advance past that window before trying again
+    instead of immediately retrying the same one."""
+    while True:
+        now = int(time.time())
+        target, entry_time = _next_entry(now, entry_lead)
+        if int(time.time()) < entry_time:
+            logger.info(
+                "Bootstrap: waiting for window %s (entry at %s)",
+                fmt_local(target),
+                fmt_local(entry_time),
+            )
+            sleep_until(entry_time)
+        pending = trade_open(cfg, db, notifier, target)
+        if pending is not None:
+            return pending
+        # Failed — sleep past this window so the next iteration targets a
+        # different one (otherwise _next_entry would pick the same window
+        # again until its candle starts).
+        sleep_until(target + 1)
+
+
 def _settle(db: Database, trade: dict, settled_candle: dict) -> tuple[float, float, str, bool]:
     actual = "UP" if settled_candle["close"] >= settled_candle["open"] else "DOWN"
     won = actual == trade["side"]
@@ -293,34 +319,41 @@ def main() -> None:
     except Exception as e:
         logger.exception("Reconcile failed: %s", e)
 
-    # Pipelined loop: each iteration enters a NEW window's trade just before
-    # the candle starts (entry_lead seconds early), then settles the previous
-    # window's trade ~settle_buffer seconds after its candle closes. This
-    # keeps the bot trading every single 5-min window without gaps.
-    pending: dict | None = None
+    # Pipelined loop. Each iteration:
+    #   1. Enter trade for the window that comes AFTER `pending`'s window.
+    #      Target is computed as `pending.window_ts + 300` — NOT from `now`,
+    #      because at iteration start `now` is still inside the previous
+    #      window (we just entered it ~10s ago) and `_next_entry(now)` would
+    #      re-pick the same window, causing every other window to be skipped.
+    #   2. Settle `pending` ~settle_buffer seconds after its candle closes.
+    # Result: one entry + one settlement per 5-min cycle, with no gaps.
+    pending: dict | None = _bootstrap_pending(cfg, db, notifier, entry_lead)
 
     while True:
         try:
-            now = int(time.time())
-            target_window, entry_time = _next_entry(now, entry_lead)
+            next_window = pending["window_ts"] + 300
+            next_entry_time = next_window - entry_lead
 
-            if now < entry_time:
+            now = int(time.time())
+            if now < next_entry_time:
                 logger.info(
                     "Waiting %ds for window %s (entry at %s)",
-                    entry_time - now,
-                    fmt_local(target_window),
-                    fmt_local(entry_time),
+                    next_entry_time - now,
+                    fmt_local(next_window),
+                    fmt_local(next_entry_time),
                 )
-                sleep_until(entry_time)
+                sleep_until(next_entry_time)
 
-            new_pending = trade_open(cfg, db, notifier, target_window)
+            new_pending = trade_open(cfg, db, notifier, next_window)
 
-            if pending is not None:
-                settle_at = pending["window_ts"] + 300 + settle_buffer
-                sleep_until(settle_at)
-                trade_settle(cfg, db, notifier, pending)
+            settle_at = pending["window_ts"] + 300 + settle_buffer
+            sleep_until(settle_at)
+            trade_settle(cfg, db, notifier, pending)
 
-            pending = new_pending
+            # If the new entry failed (insufficient balance, missing candles,
+            # duplicate row, …) re-bootstrap from the next live window so we
+            # don't lose the trading cadence permanently.
+            pending = new_pending or _bootstrap_pending(cfg, db, notifier, entry_lead)
 
         except KeyboardInterrupt:
             logger.info("Shutting down")
