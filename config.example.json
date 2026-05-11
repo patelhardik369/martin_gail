@@ -1,0 +1,9 @@
+{
+  "initial_balance": 1000.0,
+  "base_shares": 5,
+  "bet_multiplier": 2,
+  "max_doubles": 6,
+  "db_path": "data/trades.db",
+  "settlement_buffer_seconds": 5,
+  "entry_lead_seconds": 10
+}
