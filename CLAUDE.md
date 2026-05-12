@@ -13,41 +13,56 @@ It is **paper-only** today (no funded wallet, no real orders). State persists
 in SQLite so the bot can be restarted without losing balance/streak.
 
 ## How a single trade cycle works
-The loop is **pipelined** so the bot trades every 5-min window with no gaps.
-At any time at most one trade is "pending settlement". Each iteration enters
-the next window's trade just BEFORE that candle starts (while Polymarket
-odds are still ~50/50), then settles the previous window's trade shortly
-after its candle closes.
+The bot trades **every other 5-min window** — one trade per 10 minutes,
+6 trades per hour. Trade windows are aligned to multiples of 600s, so the
+bot trades :00, :10, :20, :30, :40, :50 and **skips** :05, :15, :25, :35,
+:45, :55.
 
-For each upcoming window `W` (Unix-time multiple of 300):
-1. Sleep until `W − entry_lead_seconds` (default 10s before the candle starts —
-   leaves room for order placement / acceptance latency so a limit order
-   actually fills before odds drift). If the bot is slightly late, it still
-   enters immediately as long as the candle hasn't started yet (`now < W`).
-2. Fetch the last 30 closed 5-min BTCUSDT candles from Binance (the candle
-   still in progress is INCLUDED — it carries the freshest data and is
-   ~99% complete at entry time).
-3. Run `strategy.predict_direction(candles)` → `UP` or `DOWN` + signal score.
-4. Build the Polymarket slug `btc-updown-5m-{W}` and call gamma-api to pull
-   the current UP / DOWN share prices. Fallback to `$0.50 / $0.50` on failure.
-5. Compute bet size from martingale state (`base_shares × multiplier^step`,
-   capped at `max_doubles`).
-6. Record the trade as `open` in `data/trades.db` and notify Telegram.
-7. Sleep until `prev_window + 300 + settlement_buffer_seconds` (settle the
-   PREVIOUS window's trade, not the one we just opened).
-8. Fetch the candle whose `open_time == prev_window` and decide outcome:
-   `UP` wins when `close >= open`, else `DOWN` wins.
-9. Update the trade row with outcome / P&L / new balance and notify Telegram.
-10. Loop — the next iteration's step-1 is roughly 5 minutes later.
+This spacing is deliberate. With back-to-back 5-min trades, the bot would
+size bet N+1 ~10s before bet N's candle even closed — meaning bet N+1's
+martingale step would be based on a stale streak (bet N not yet settled).
+By skipping the in-between window, every new entry happens AFTER the
+previous trade has fully settled, so the martingale step is always based
+on a known win/loss outcome.
+
+The loop is **sequential** (not pipelined): at any time at most one trade
+is open. Each iteration first settles the previous trade, then enters the
+next one in the 10-min slot.
+
+For each trade window `W` (Unix-time multiple of 600):
+1. *(start of iteration: previous trade for window `W−600` is open)*
+   Sleep until `W − 600 + 300 + settlement_buffer_seconds` and settle the
+   previous trade by fetching the candle whose `open_time == W − 600`.
+   `UP` wins when `close >= open`, else `DOWN` wins. Update the row with
+   outcome / P&L / new balance and notify Telegram.
+2. Sleep until `W − entry_lead_seconds` (default 10s before the candle
+   starts — leaves room for order placement / acceptance latency so a
+   limit order actually fills before odds drift). If slightly late, enter
+   immediately as long as the candle hasn't started yet (`now < W`).
+3. Fetch the last 30 5-min BTCUSDT candles from Binance (the candle still
+   in progress is INCLUDED — it carries the freshest data and is ~99%
+   complete at entry time).
+4. Run `strategy.predict_direction(candles)` → `UP` or `DOWN` + score.
+5. Build the Polymarket slug `btc-updown-5m-{W}` and call gamma-api for
+   the current UP / DOWN share prices. Fallback to `$0.50 / $0.50` on
+   failure.
+6. Compute bet size from martingale state (`base_shares × multiplier^step`,
+   capped at `max_doubles`). Streak is read from the DB and is now
+   guaranteed correct because step 1 already settled the previous trade.
+7. Record the trade as `open` in `data/trades.db` and notify Telegram.
+8. Loop — the next iteration's step-1 fires ~5 minutes later, when this
+   trade's candle closes.
 
 Timing example (entry_lead=10, settle_buffer=5):
 ```
 T=W-10      open trade for window W
-T=W+0       window W candle starts (we already hold the position)
-T=W+290     open trade for window W+300
-T=W+305     settle window W
-T=W+590     open trade for window W+600
-T=W+605     settle window W+300
+T=W+0       window W candle starts
+T=W+300     window W candle closes
+T=W+305     settle window W                      ← we now know win/lose
+T=W+590     open trade for window W+600          ← skip W+300, martingale step is correct
+T=W+600     window W+600 candle starts
+T=W+900     window W+600 candle closes
+T=W+905     settle window W+600
 …
 ```
 

@@ -26,16 +26,20 @@ def _pretty_reason(reason: str) -> str:
 
 
 def _next_entry(now: int, entry_lead: int) -> tuple[int, int]:
-    """Pick the next 5-min boundary we can still bet on (i.e., one that
-    hasn't started yet) and the moment to enter.
+    """Pick the next *trade-eligible* 5-min boundary and the moment to enter.
 
-    Ideal entry is `entry_lead` seconds before the window starts, so odds
-    are still near 50/50. If we're slightly late (within entry_lead seconds
-    of window start) we enter immediately — still before the candle opens.
-    If the window has already begun (now >= W), we skip to the next one.
+    The bot only trades windows aligned to 10-min boundaries (multiples of
+    600s) — i.e. :00, :10, :20, :30, :40, :50 — and skips the in-between
+    windows. This guarantees the previous trade has fully settled before we
+    size the next bet, so the martingale step is never stale.
+
+    Ideal entry is `entry_lead` seconds before the window starts. If we're
+    slightly late (within entry_lead seconds of window start) we enter
+    immediately — still before the candle opens. If the window has already
+    begun (now >= W), we skip to the next 10-min boundary.
 
     Returns (target_window_ts, entry_time)."""
-    target = ((now // 300) + 1) * 300
+    target = ((now // 600) + 1) * 600
     entry_time = max(now, target - entry_lead)
     return target, entry_time
 
@@ -310,7 +314,8 @@ def main() -> None:
             f"Losses:  {stats['losses']}",
             f"Net P&L: {money_signed(stats['total_pnl'])}",
             "",
-            f"Entry lead: {entry_lead}s before each 5-min window",
+            f"Cadence:    1 trade per 10 min (skips alternate 5-min windows)",
+            f"Entry lead: {entry_lead}s before each window",
         ])
     )
 
@@ -319,22 +324,35 @@ def main() -> None:
     except Exception as e:
         logger.exception("Reconcile failed: %s", e)
 
-    # Pipelined loop. Each iteration:
-    #   1. Enter trade for the window that comes AFTER `pending`'s window.
-    #      Target is computed as `pending.window_ts + 300` — NOT from `now`,
-    #      because at iteration start `now` is still inside the previous
-    #      window (we just entered it ~10s ago) and `_next_entry(now)` would
-    #      re-pick the same window, causing every other window to be skipped.
-    #   2. Settle `pending` ~settle_buffer seconds after its candle closes.
-    # Result: one entry + one settlement per 5-min cycle, with no gaps.
+    # Sequential loop, one trade every 10 minutes. Each iteration:
+    #   1. Settle `pending` ~settle_buffer seconds after its candle closes.
+    #      After this, the DB reflects win/lose, so the next entry's
+    #      martingale step is based on a known outcome (no stale streak).
+    #   2. Enter trade for the window 10 minutes after `pending`'s window
+    #      (i.e. skipping the immediately-following 5-min window). Target
+    #      is `pending.window_ts + 600` — NOT from `now` — to keep the
+    #      cadence locked to even-aligned 10-min boundaries.
     pending: dict | None = _bootstrap_pending(cfg, db, notifier, entry_lead)
 
     while True:
         try:
-            next_window = pending["window_ts"] + 300
-            next_entry_time = next_window - entry_lead
+            prev_window_ts = pending["window_ts"]
 
+            settle_at = prev_window_ts + 300 + settle_buffer
+            sleep_until(settle_at)
+            trade_settle(cfg, db, notifier, pending)
+            pending = None  # settled — don't re-settle on shutdown
+
+            next_window = prev_window_ts + 600
+            next_entry_time = next_window - entry_lead
             now = int(time.time())
+            if now >= next_window:
+                logger.warning(
+                    "Missed entry for window %s (now past start), re-bootstrapping",
+                    fmt_local(next_window),
+                )
+                pending = _bootstrap_pending(cfg, db, notifier, entry_lead)
+                continue
             if now < next_entry_time:
                 logger.info(
                     "Waiting %ds for window %s (entry at %s)",
@@ -344,20 +362,16 @@ def main() -> None:
                 )
                 sleep_until(next_entry_time)
 
-            new_pending = trade_open(cfg, db, notifier, next_window)
-
-            settle_at = pending["window_ts"] + 300 + settle_buffer
-            sleep_until(settle_at)
-            trade_settle(cfg, db, notifier, pending)
-
-            # If the new entry failed (insufficient balance, missing candles,
-            # duplicate row, …) re-bootstrap from the next live window so we
-            # don't lose the trading cadence permanently.
-            pending = new_pending or _bootstrap_pending(cfg, db, notifier, entry_lead)
+            # If the new entry fails (insufficient balance, missing candles,
+            # duplicate row, …) re-bootstrap from the next live 10-min
+            # window so we don't lose the trading cadence permanently.
+            pending = trade_open(cfg, db, notifier, next_window) or \
+                _bootstrap_pending(cfg, db, notifier, entry_lead)
 
         except KeyboardInterrupt:
             logger.info("Shutting down")
-            # Try to settle a pending trade if its window has already closed
+            # Settle a still-open trade if its window has already closed
+            # (only happens if Ctrl+C lands mid-settle on step 1).
             if pending is not None:
                 try:
                     settle_at = pending["window_ts"] + 300 + settle_buffer
