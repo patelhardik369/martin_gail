@@ -76,9 +76,12 @@ def _bootstrap_pending(cfg: dict, db: "Database", notifier: "TelegramNotifier", 
 
 
 def _settle_with_winner(
-    db: Database, trade: dict, winner: str, close_price: float | None
+    db: Database, trade: dict, winner: str, candle: dict | None
 ) -> tuple[float, float, bool]:
-    """Apply Polymarket-declared winner to a trade row. Returns (pnl, new_balance, won)."""
+    """Apply Polymarket-declared winner to a trade row. The Binance settlement
+    candle (if available) supplies the true OHLC for the bet window — it's
+    informational only, the winner is purely Polymarket's call. Returns
+    (pnl, new_balance, won)."""
     won = winner == trade["side"]
     pnl = round(
         trade["shares"] * (1 - trade["price"]) if won else -trade["shares"] * trade["price"],
@@ -92,7 +95,10 @@ def _settle_with_winner(
         balance_after=new_balance,
         won=won,
         resolved_at=int(time.time()),
-        close_price=close_price,
+        open_price=candle["open"] if candle else None,
+        close_price=candle["close"] if candle else None,
+        window_high=candle["high"] if candle else None,
+        window_low=candle["low"] if candle else None,
     )
     return pnl, new_balance, won
 
@@ -131,11 +137,10 @@ def reconcile_open_trades(
             )
 
         winner = wait_for_resolution(slug, budget_s=budget, on_budget_exceeded=_overrun_msg)
-        # Best-effort: pull the Binance close just for display context.
+        # Best-effort: pull the Binance OHLC for display + audit on the row.
         candle = get_kline_by_open_time("BTCUSDT", "5m", window_ts * 1000)
-        close_price = candle["close"] if candle else None
         pnl, bal, won = _settle_with_winner(
-            db, {**trade, "id": trade["id"]}, winner, close_price
+            db, {**trade, "id": trade["id"]}, winner, candle
         )
         notifier.send(
             "\n".join([
@@ -302,7 +307,7 @@ def trade_settle(
         "price": pending["price"],
     }
     pnl, new_balance, won = _settle_with_winner(
-        db, trade_row, winner, settled["close"] if settled else None
+        db, trade_row, winner, settled
     )
 
     streak_type, streak_count = db.get_streak()

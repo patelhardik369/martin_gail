@@ -14,6 +14,8 @@ CREATE TABLE IF NOT EXISTS trades (
     price REAL NOT NULL,
     cost REAL NOT NULL,
     open_price REAL NOT NULL,
+    window_high REAL,
+    window_low REAL,
     close_price REAL,
     actual_outcome TEXT,
     pnl REAL,
@@ -51,6 +53,11 @@ class Database:
         self.path = path
         with self._conn() as c:
             c.executescript(SCHEMA)
+            # Idempotent column adds for DBs created before window_high/low.
+            existing = {r["name"] for r in c.execute("PRAGMA table_info(trades)").fetchall()}
+            for col in ("window_high", "window_low"):
+                if col not in existing:
+                    c.execute(f"ALTER TABLE trades ADD COLUMN {col} REAL")
             row = c.execute(
                 "SELECT value FROM state WHERE key='balance'"
             ).fetchone()
@@ -135,19 +142,36 @@ class Database:
         balance_after: float,
         won: bool,
         resolved_at: int,
+        open_price: float | None = None,
         close_price: float | None = None,
+        window_high: float | None = None,
+        window_low: float | None = None,
     ) -> None:
+        """Settle a trade. When the actual Binance candle is available the
+        caller should pass open/high/low/close from it — open_price is
+        overwritten so the row reflects the real candle open instead of the
+        pre-window estimate captured at entry time."""
         status = "won" if won else "lost"
         with self._conn() as c:
+            # Build the SET clause dynamically so we only overwrite
+            # open_price when a real value is supplied.
+            sets = [
+                "close_price=?", "window_high=?", "window_low=?",
+                "actual_outcome=?", "pnl=?", "balance_after=?",
+                "status=?", "closed_at=?", "resolved_at=?",
+            ]
+            params: list = [
+                close_price, window_high, window_low,
+                actual_outcome, pnl, balance_after,
+                status, _utcnow_iso(), resolved_at,
+            ]
+            if open_price is not None:
+                sets.insert(0, "open_price=?")
+                params.insert(0, open_price)
+            params.append(trade_id)
             c.execute(
-                """
-                UPDATE trades
-                   SET close_price=?, actual_outcome=?, pnl=?,
-                       balance_after=?, status=?, closed_at=?, resolved_at=?
-                 WHERE id=?
-                """,
-                (close_price, actual_outcome, pnl, balance_after,
-                 status, _utcnow_iso(), resolved_at, trade_id),
+                f"UPDATE trades SET {', '.join(sets)} WHERE id=?",
+                params,
             )
             self._set_balance(c, balance_after)
 
