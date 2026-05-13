@@ -5,7 +5,12 @@ from .binance_client import get_klines, get_kline_by_open_time
 from .config import load_config
 from .database import Database
 from .martingale import next_bet
-from .polymarket_client import get_event_by_slug, parse_prices
+from .polymarket_client import (
+    get_event_by_slug,
+    parse_prices,
+    parse_token_ids,
+)
+from .polymarket_resolver import wait_for_resolution
 from .strategy import predict_direction
 from .telegram_notifier import TelegramNotifier
 from .utils import (
@@ -48,7 +53,7 @@ def _bootstrap_pending(cfg: dict, db: "Database", notifier: "TelegramNotifier", 
     """Wait for the next live entry opportunity and open the first trade.
 
     Loops until a trade is successfully opened so the main pipeline always
-    has a non-None `pending` to anchor its 5-min cadence on. If an attempt
+    has a non-None `pending` to anchor its 10-min cadence on. If an attempt
     fails for any reason, we advance past that window before trying again
     instead of immediately retrying the same one."""
     while True:
@@ -70,9 +75,11 @@ def _bootstrap_pending(cfg: dict, db: "Database", notifier: "TelegramNotifier", 
         sleep_until(target + 1)
 
 
-def _settle(db: Database, trade: dict, settled_candle: dict) -> tuple[float, float, str, bool]:
-    actual = "UP" if settled_candle["close"] >= settled_candle["open"] else "DOWN"
-    won = actual == trade["side"]
+def _settle_with_winner(
+    db: Database, trade: dict, winner: str, close_price: float | None
+) -> tuple[float, float, bool]:
+    """Apply Polymarket-declared winner to a trade row. Returns (pnl, new_balance, won)."""
+    won = winner == trade["side"]
     pnl = round(
         trade["shares"] * (1 - trade["price"]) if won else -trade["shares"] * trade["price"],
         4,
@@ -80,33 +87,62 @@ def _settle(db: Database, trade: dict, settled_candle: dict) -> tuple[float, flo
     new_balance = round(db.get_balance() + pnl, 4)
     db.close_trade(
         trade_id=trade["id"] if "id" in trade else trade["trade_id"],
-        close_price=settled_candle["close"],
-        actual_outcome=actual,
+        actual_outcome=winner,
         pnl=pnl,
         balance_after=new_balance,
         won=won,
+        resolved_at=int(time.time()),
+        close_price=close_price,
     )
-    return pnl, new_balance, actual, won
+    return pnl, new_balance, won
 
 
-def reconcile_open_trades(db: Database, notifier: TelegramNotifier) -> None:
-    now = int(time.time())
+def reconcile_open_trades(
+    cfg: dict, db: Database, notifier: TelegramNotifier
+) -> None:
+    """For any orphan open trade whose 5-min window already closed, wait for
+    Polymarket to declare a winner (no Binance fallback). Uses the same
+    soft-budget logic as live settle so the user is told if it's stuck."""
+    budget = int(cfg["resolution_budget_seconds"])
     for trade in db.open_trades():
         window_ts = int(trade["window_ts"])
-        if now < window_ts + 305:
+        # If the candle hasn't even closed yet, leave it alone for the main loop.
+        if int(time.time()) < window_ts + 300:
             continue
-        candle = get_kline_by_open_time("BTCUSDT", "5m", window_ts * 1000)
-        if not candle:
-            logger.warning("No settlement candle for orphan trade #%s", trade["id"])
-            continue
-        pnl, bal, actual, won = _settle(db, trade, candle)
+        slug = trade["slug"]
         notifier.send(
             "\n".join([
-                f"🔁 Trade #{trade['id']} — Reconciled",
+                f"🔁 Trade #{trade['id']} — Reconciling",
+                "",
+                "Bot restarted with an unresolved trade.",
+                f"Window: {fmt_local(window_ts)}",
+                "Waiting for Polymarket resolution…",
+            ])
+        )
+
+        def _overrun_msg(tid: int = trade["id"]) -> None:
+            notifier.send(
+                "\n".join([
+                    f"⏳ Trade #{tid} — Resolution Pending",
+                    "",
+                    f"Polymarket has not resolved within {budget}s.",
+                    "Still waiting — no further action until it does.",
+                ])
+            )
+
+        winner = wait_for_resolution(slug, budget_s=budget, on_budget_exceeded=_overrun_msg)
+        # Best-effort: pull the Binance close just for display context.
+        candle = get_kline_by_open_time("BTCUSDT", "5m", window_ts * 1000)
+        close_price = candle["close"] if candle else None
+        pnl, bal, won = _settle_with_winner(
+            db, {**trade, "id": trade["id"]}, winner, close_price
+        )
+        notifier.send(
+            "\n".join([
+                f"{'✅' if won else '❌'} Trade #{trade['id']} — Reconciled {'WON' if won else 'LOST'}",
                 "",
                 f"Predicted: {trade['side']}",
-                f"Actual:    {actual}",
-                f"Result:    {'WON' if won else 'LOST'}",
+                f"Polymarket winner: {winner}",
                 "",
                 f"P&L:     {money_signed(pnl)}",
                 f"Balance: {money(bal)}",
@@ -118,8 +154,8 @@ def trade_open(
     cfg: dict, db: Database, notifier: TelegramNotifier, window_ts: int
 ) -> dict | None:
     """Enter a trade for the upcoming window. Returns trade-summary dict
-    (id/window/side/shares/price) used later for settlement, or None if the
-    trade was skipped (already taken, insufficient balance, no data, …)."""
+    (id/window/side/shares/price/slug) used later for settlement, or None if
+    the trade was skipped (already taken, insufficient balance, no data, …)."""
     if db.has_trade(window_ts):
         logger.info("Window %s already traded, skipping entry", window_ts)
         return None
@@ -142,6 +178,7 @@ def trade_open(
     slug = f"btc-updown-5m-{window_ts}"
     event = get_event_by_slug(slug)
     up_price, down_price = parse_prices(event)
+    up_token, down_token = parse_token_ids(event)
     price = up_price if direction == "UP" else down_price
     if not (0 < price < 1):
         price = 0.50
@@ -181,6 +218,8 @@ def trade_open(
         score=score,
         reason=reason,
         bet_step=bet["step"],
+        up_token_id=up_token,
+        down_token_id=down_token,
     )
 
     notifier.send(
@@ -217,6 +256,7 @@ def trade_open(
     return {
         "trade_id": trade_id,
         "window_ts": window_ts,
+        "slug": slug,
         "side": direction,
         "shares": shares,
         "price": price,
@@ -225,25 +265,35 @@ def trade_open(
 
 def trade_settle(
     cfg: dict, db: Database, notifier: TelegramNotifier, pending: dict
-) -> None:
+) -> bool:
+    """Wait for Polymarket to resolve `pending`'s market and settle the trade.
+
+    Returns True if resolution happened inside the soft budget (next entry
+    should fire on the originally-planned 10-min boundary), False if it
+    overran (the next round was skipped and the caller should pick the
+    next 10-min boundary >= now+entry_lead instead).
+    """
     window_ts = pending["window_ts"]
-    settled = get_kline_by_open_time("BTCUSDT", "5m", window_ts * 1000)
-    if not settled:
-        logger.warning("Settlement candle missing, retrying in 10s")
-        time.sleep(10)
-        settled = get_kline_by_open_time(
-            "BTCUSDT", "5m", window_ts * 1000, search_window_ms=120_000
-        )
-    if not settled:
+    slug = pending["slug"]
+    budget = int(cfg["resolution_budget_seconds"])
+    overran = {"flag": False}
+
+    def _overrun_msg() -> None:
+        overran["flag"] = True
         notifier.send(
             "\n".join([
-                f"⚠️ Trade #{pending['trade_id']} — Settlement Pending",
+                f"⏳ Trade #{pending['trade_id']} — Resolution Pending",
                 "",
-                "Binance candle for this window is not yet available.",
-                "Will reconcile automatically on next restart.",
+                f"Polymarket has not resolved within {budget}s.",
+                "Skipping next round — still waiting on this one.",
             ])
         )
-        return
+
+    winner = wait_for_resolution(slug, budget_s=budget, on_budget_exceeded=_overrun_msg)
+
+    # Best-effort Binance close just for the Telegram display — does not
+    # affect win/lose, which comes solely from Polymarket.
+    settled = get_kline_by_open_time("BTCUSDT", "5m", window_ts * 1000)
 
     trade_row = {
         "id": pending["trade_id"],
@@ -251,41 +301,51 @@ def trade_settle(
         "shares": pending["shares"],
         "price": pending["price"],
     }
-    pnl, new_balance, actual, won = _settle(db, trade_row, settled)
+    pnl, new_balance, won = _settle_with_winner(
+        db, trade_row, winner, settled["close"] if settled else None
+    )
 
     streak_type, streak_count = db.get_streak()
     stats = db.stats()
-    delta = settled["close"] - settled["open"]
     win_rate = (stats["wins"] / stats["total"] * 100.0) if stats["total"] else 0.0
 
-    notifier.send(
-        "\n".join([
-            f"{'✅' if won else '❌'} Trade #{pending['trade_id']} — {'WON' if won else 'LOST'}",
-            "",
-            "🎯 Outcome",
-            f"Predicted: {pending['side']}",
-            f"Actual:    {actual}",
+    lines = [
+        f"{'✅' if won else '❌'} Trade #{pending['trade_id']} — {'WON' if won else 'LOST'}",
+        "",
+        "🎯 Outcome",
+        f"Predicted:        {pending['side']}",
+        f"Polymarket winner: {winner}",
+    ]
+    if settled is not None:
+        delta = settled["close"] - settled["open"]
+        binance_dir = "UP" if delta >= 0 else "DOWN"
+        diverged = " ⚠️ diverged" if binance_dir != winner else ""
+        lines += [
+            f"Binance:           {binance_dir} ({money_signed(delta)}){diverged}",
             "",
             "📍 Price",
             f"BTC open:  {money(settled['open'])}",
             f"BTC close: {money(settled['close'])}",
-            f"Change:    {money_signed(delta)}",
-            "",
-            "💰 P&L",
-            f"This trade: {money_signed(pnl)}",
-            f"Balance:    {money(new_balance)}",
-            "",
-            "📈 Streak",
-            f"Current: {streak_label(streak_type, streak_count)}",
-            "",
-            "📊 Record",
-            f"Trades:   {stats['total']}",
-            f"Wins:     {stats['wins']}",
-            f"Losses:   {stats['losses']}",
-            f"Win rate: {win_rate:.1f}%",
-            f"Net P&L:  {money_signed(stats['total_pnl'])}",
-        ])
-    )
+        ]
+    lines += [
+        "",
+        "💰 P&L",
+        f"This trade: {money_signed(pnl)}",
+        f"Balance:    {money(new_balance)}",
+        "",
+        "📈 Streak",
+        f"Current: {streak_label(streak_type, streak_count)}",
+        "",
+        "📊 Record",
+        f"Trades:   {stats['total']}",
+        f"Wins:     {stats['wins']}",
+        f"Losses:   {stats['losses']}",
+        f"Win rate: {win_rate:.1f}%",
+        f"Net P&L:  {money_signed(stats['total_pnl'])}",
+    ]
+    notifier.send("\n".join(lines))
+
+    return not overran["flag"]
 
 
 def main() -> None:
@@ -299,6 +359,7 @@ def main() -> None:
 
     entry_lead = int(cfg["entry_lead_seconds"])
     settle_buffer = int(cfg["settlement_buffer_seconds"])
+    resolution_budget = int(cfg["resolution_budget_seconds"])
 
     stats = db.stats()
     notifier.send(
@@ -316,22 +377,21 @@ def main() -> None:
             "",
             f"Cadence:    1 trade per 10 min (skips alternate 5-min windows)",
             f"Entry lead: {entry_lead}s before each window",
+            f"Resolution: Polymarket only (budget {resolution_budget}s, skip on overrun)",
         ])
     )
 
     try:
-        reconcile_open_trades(db, notifier)
+        reconcile_open_trades(cfg, db, notifier)
     except Exception as e:
         logger.exception("Reconcile failed: %s", e)
 
     # Sequential loop, one trade every 10 minutes. Each iteration:
-    #   1. Settle `pending` ~settle_buffer seconds after its candle closes.
-    #      After this, the DB reflects win/lose, so the next entry's
-    #      martingale step is based on a known outcome (no stale streak).
-    #   2. Enter trade for the window 10 minutes after `pending`'s window
-    #      (i.e. skipping the immediately-following 5-min window). Target
-    #      is `pending.window_ts + 600` — NOT from `now` — to keep the
-    #      cadence locked to even-aligned 10-min boundaries.
+    #   1. Settle `pending` by waiting on Polymarket. Inside the soft
+    #      budget the next entry stays on schedule (W+600). On overrun,
+    #      we keep waiting indefinitely and the next entry slides to the
+    #      next free 10-min boundary after settlement.
+    #   2. Enter the next trade for that 10-min boundary.
     pending: dict | None = _bootstrap_pending(cfg, db, notifier, entry_lead)
 
     while True:
@@ -340,45 +400,36 @@ def main() -> None:
 
             settle_at = prev_window_ts + 300 + settle_buffer
             sleep_until(settle_at)
-            trade_settle(cfg, db, notifier, pending)
+            on_schedule = trade_settle(cfg, db, notifier, pending)
             pending = None  # settled — don't re-settle on shutdown
 
-            next_window = prev_window_ts + 600
-            next_entry_time = next_window - entry_lead
-            now = int(time.time())
-            if now >= next_window:
-                logger.warning(
-                    "Missed entry for window %s (now past start), re-bootstrapping",
-                    fmt_local(next_window),
-                )
+            if on_schedule:
+                next_window = prev_window_ts + 600
+                next_entry_time = next_window - entry_lead
+                now = int(time.time())
+                if now >= next_window:
+                    # Lost the slot during settlement (unlikely but possible
+                    # with clock skew). Re-bootstrap to the next live boundary.
+                    pending = _bootstrap_pending(cfg, db, notifier, entry_lead)
+                    continue
+                if now < next_entry_time:
+                    logger.info(
+                        "Waiting %ds for window %s (entry at %s)",
+                        next_entry_time - now,
+                        fmt_local(next_window),
+                        fmt_local(next_entry_time),
+                    )
+                    sleep_until(next_entry_time)
+                pending = trade_open(cfg, db, notifier, next_window) or \
+                    _bootstrap_pending(cfg, db, notifier, entry_lead)
+            else:
+                # Settle overran the budget — skip whatever 10-min slot(s)
+                # passed while we waited, pick up at the next live boundary.
+                logger.info("Settle overran budget — resuming on next 10-min boundary")
                 pending = _bootstrap_pending(cfg, db, notifier, entry_lead)
-                continue
-            if now < next_entry_time:
-                logger.info(
-                    "Waiting %ds for window %s (entry at %s)",
-                    next_entry_time - now,
-                    fmt_local(next_window),
-                    fmt_local(next_entry_time),
-                )
-                sleep_until(next_entry_time)
-
-            # If the new entry fails (insufficient balance, missing candles,
-            # duplicate row, …) re-bootstrap from the next live 10-min
-            # window so we don't lose the trading cadence permanently.
-            pending = trade_open(cfg, db, notifier, next_window) or \
-                _bootstrap_pending(cfg, db, notifier, entry_lead)
 
         except KeyboardInterrupt:
             logger.info("Shutting down")
-            # Settle a still-open trade if its window has already closed
-            # (only happens if Ctrl+C lands mid-settle on step 1).
-            if pending is not None:
-                try:
-                    settle_at = pending["window_ts"] + 300 + settle_buffer
-                    if int(time.time()) >= settle_at:
-                        trade_settle(cfg, db, notifier, pending)
-                except Exception:
-                    pass
             notifier.send(
                 "\n".join([
                     "🛑 Bot Stopped",

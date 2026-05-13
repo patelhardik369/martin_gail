@@ -31,10 +31,15 @@ next one in the 10-min slot.
 
 For each trade window `W` (Unix-time multiple of 600):
 1. *(start of iteration: previous trade for window `W−600` is open)*
-   Sleep until `W − 600 + 300 + settlement_buffer_seconds` and settle the
-   previous trade by fetching the candle whose `open_time == W − 600`.
-   `UP` wins when `close >= open`, else `DOWN` wins. Update the row with
-   outcome / P&L / new balance and notify Telegram.
+   Sleep until `W − 600 + 300 + settlement_buffer_seconds`, then **wait
+   for Polymarket** to declare the winner via `bot/polymarket_resolver.py`
+   (WebSocket primary, gamma-api HTTP fallback). The Binance candle is
+   not used for settlement — Polymarket is the single source of truth.
+   - Inside `resolution_budget_seconds` (default 240s): settle, then
+     stay on the planned 10-min cadence and enter the next window.
+   - On overrun: send a "skipping next round" Telegram message and keep
+     waiting indefinitely. When resolution finally arrives, settle and
+     re-enter at the next live 10-min boundary.
 2. Sleep until `W − entry_lead_seconds` (default 10s before the candle
    starts — leaves room for order placement / acceptance latency so a
    limit order actually fills before odds drift). If slightly late, enter
@@ -53,17 +58,16 @@ For each trade window `W` (Unix-time multiple of 600):
 8. Loop — the next iteration's step-1 fires ~5 minutes later, when this
    trade's candle closes.
 
-Timing example (entry_lead=10, settle_buffer=5):
+Timing example (entry_lead=10, settle_buffer=5, resolution_budget=240):
 ```
 T=W-10      open trade for window W
 T=W+0       window W candle starts
 T=W+300     window W candle closes
-T=W+305     settle window W                      ← we now know win/lose
-T=W+590     open trade for window W+600          ← skip W+300, martingale step is correct
-T=W+600     window W+600 candle starts
-T=W+900     window W+600 candle closes
-T=W+905     settle window W+600
-…
+T=W+305     begin waiting on Polymarket
+T=W+305-545 Polymarket resolves (typical) → settle, on-schedule
+T=W+545     budget elapsed → notify "skipping next round", keep waiting
+T=W+590     open trade for window W+600                ← only if Polymarket already resolved
+T=…         on overrun, the next entry is the next 10-min boundary >= now
 ```
 
 PnL per trade:
@@ -102,20 +106,23 @@ inside a $1000 bankroll.
 ## APIs
 | Service | Auth | Used for | Endpoint |
 |---|---|---|---|
-| Binance | none | 5-min BTC klines | `GET https://api.binance.com/api/v3/klines?symbol=BTCUSDT&interval=5m` |
-| Polymarket Gamma | none | Event-by-slug (UP/DOWN price) | `GET https://gamma-api.polymarket.com/events?slug={slug}` |
+| Binance | none | 5-min BTC klines (signal + display) | `GET https://api.binance.com/api/v3/klines?symbol=BTCUSDT&interval=5m` |
+| Polymarket Gamma | none | Event-by-slug (UP/DOWN price, clobTokenIds, resolution check) | `GET https://gamma-api.polymarket.com/events?slug={slug}` |
+| Polymarket Market WS | none | `market_resolved` push events (winner) | `wss://ws-subscriptions-clob.polymarket.com/ws/market` |
 | Telegram Bot | bot token | Notifications | `POST https://api.telegram.org/bot{token}/sendMessage` |
 
-WebSockets aren't used yet — trades are bounded by 5-min boundaries so polling
-is sufficient and more robust. A WS upgrade (binance kline stream + polymarket
-market socket) is a stretch goal for tighter entry timing and real trading.
+The Polymarket market WS is the primary settlement channel — subscribed with
+`custom_feature_enabled=true` so the server emits `market_resolved` events the
+moment the price oracle posts. The gamma-api HTTP endpoint is polled as a
+fallback (primer before WS connect; every 15s while connected) in case the WS
+drops or we subscribed after resolution fired.
 
 ## File layout
 ```
 martin_gail/
 ├── CLAUDE.md                # This file
 ├── README.md                # Quick start
-├── requirements.txt         # requests + python-dotenv (that's it)
+├── requirements.txt         # requests + python-dotenv + websocket-client
 ├── config.example.json      # Strategy params
 ├── .env.example             # TELEGRAM_BOT_TOKEN + TELEGRAM_CHAT_ID
 ├── .gitignore
@@ -125,7 +132,8 @@ martin_gail/
 │   ├── config.py            # Load config.json + .env
 │   ├── utils.py             # window_ts, sleep_until, fmt_ts
 │   ├── binance_client.py    # Fetch 5-min klines (REST)
-│   ├── polymarket_client.py # Fetch event by slug, parse UP/DOWN prices
+│   ├── polymarket_client.py # Fetch event by slug, parse UP/DOWN prices, parse resolution
+│   ├── polymarket_resolver.py # Wait for winner via WS (primary) + HTTP (fallback)
 │   ├── strategy.py          # Trend analysis → UP/DOWN prediction
 │   ├── martingale.py        # Bet sizing
 │   ├── database.py          # SQLite: trades table + state KV
@@ -138,7 +146,10 @@ martin_gail/
 - `trades` — one row per 5-min window. UNIQUE(window_ts) prevents duplicates
   on restart. Columns: `id, window_ts, slug, side, shares, price, cost,
   open_price, close_price, actual_outcome, pnl, balance_after, bet_step,
-  score, reason, status (open|won|lost), opened_at, closed_at`.
+  score, reason, up_token_id, down_token_id, resolved_at, status
+  (open|won|lost), opened_at, closed_at`. `actual_outcome` is the
+  Polymarket-declared winner (`UP`/`DOWN`); `close_price` is the Binance
+  close at the same moment, kept for display/audit only.
 - `state` — key/value KV. Today only `balance` lives here; streak is derived
   from the trades table (`get_streak` walks back from the latest resolved row).
 
@@ -156,13 +167,16 @@ The bot starts, posts a "Bot started" summary to Telegram, waits for the next
 
 ## Recovery on restart
 On startup `main.py` calls `reconcile_open_trades()` which finds any rows left
-in `status='open'` whose window has already closed and settles them using the
-real Binance close. This makes the bot crash-safe.
+in `status='open'` whose window has already closed and waits for Polymarket
+to resolve them (same WS+HTTP path as live settle). Because Polymarket retains
+historical resolutions forever, this works even if the bot was down for hours.
+There is no Binance fallback — if a market is genuinely unresolved (e.g. UMA
+dispute), the bot keeps waiting and announces the delay on Telegram.
 
 ## Stretch goals (NOT BUILT)
 - Real trading via Polymarket CLOB (`py-clob-client`) with a funded wallet
-- WebSocket price feeds (Binance kline socket + Polymarket market socket) for
-  last-second entry timing à la the well-known reference bot
+- Binance kline WS for last-second entry timing à la the well-known reference
+  bot (Polymarket WS is already wired for settlement)
 - Adaptive bet sizing (compute exact share count to cover prior loss given
   the current UP/DOWN price, instead of flat doubling)
 - Multi-symbol (ETH/SOL 5-min markets alongside BTC)
@@ -171,9 +185,12 @@ real Binance close. This makes the bot crash-safe.
 ## Conventions in this codebase
 - All timestamps are UTC seconds (`window_ts = int`). Binance kline ms-times
   are converted at the edge.
-- No async — every API call is plain `requests` with a 10s timeout. The 5-min
-  cadence makes threading/asyncio unnecessary.
-- No third-party Binance/Polymarket/Telegram SDKs — raw HTTP keeps the dep
-  surface tiny (`requests`, `python-dotenv`) and avoids version churn.
+- No async — every API call is plain `requests` with a 10s timeout. The
+  Polymarket WS runs on a single background thread inside `polymarket_resolver`
+  and pushes the winner back through a thread-safe holder; the main loop
+  stays synchronous.
+- No third-party Binance/Polymarket/Telegram SDKs — raw HTTP + bare
+  `websocket-client` keeps the dep surface tiny (`requests`, `python-dotenv`,
+  `websocket-client`) and avoids version churn.
 - Floats for money are fine at this scale; everything is rounded to 4 dp at
   the storage boundary.

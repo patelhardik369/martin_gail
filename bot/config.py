@@ -22,6 +22,10 @@ DEFAULTS = {
     # 10s leaves room for order placement/acceptance latency — a limit order
     # may not fill if the odds have already moved by the time it's accepted.
     "entry_lead_seconds": 10,
+    # Soft budget for Polymarket to resolve. Inside this window the next
+    # 10-min entry stays on schedule. If it expires, the bot announces a
+    # skip and keeps waiting indefinitely (no Binance fallback).
+    "resolution_budget_seconds": 240,
 }
 
 

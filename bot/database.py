@@ -21,6 +21,9 @@ CREATE TABLE IF NOT EXISTS trades (
     bet_step INTEGER,
     score REAL,
     reason TEXT,
+    up_token_id TEXT,
+    down_token_id TEXT,
+    resolved_at INTEGER,
     status TEXT NOT NULL DEFAULT 'open',
     opened_at TEXT NOT NULL,
     closed_at TEXT
@@ -104,18 +107,22 @@ class Database:
         score: float,
         reason: str,
         bet_step: int,
+        up_token_id: str | None = None,
+        down_token_id: str | None = None,
     ) -> int:
         with self._conn() as c:
             cur = c.execute(
                 """
                 INSERT INTO trades(window_ts, slug, side, shares, price, cost,
                                    open_price, score, reason, bet_step,
+                                   up_token_id, down_token_id,
                                    status, opened_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'open', ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'open', ?)
                 """,
                 (
                     window_ts, slug, side, shares, price, cost,
-                    open_price, score, reason, bet_step, _utcnow_iso(),
+                    open_price, score, reason, bet_step,
+                    up_token_id, down_token_id, _utcnow_iso(),
                 ),
             )
             return int(cur.lastrowid)
@@ -123,11 +130,12 @@ class Database:
     def close_trade(
         self,
         trade_id: int,
-        close_price: float,
         actual_outcome: str,
         pnl: float,
         balance_after: float,
         won: bool,
+        resolved_at: int,
+        close_price: float | None = None,
     ) -> None:
         status = "won" if won else "lost"
         with self._conn() as c:
@@ -135,11 +143,11 @@ class Database:
                 """
                 UPDATE trades
                    SET close_price=?, actual_outcome=?, pnl=?,
-                       balance_after=?, status=?, closed_at=?
+                       balance_after=?, status=?, closed_at=?, resolved_at=?
                  WHERE id=?
                 """,
                 (close_price, actual_outcome, pnl, balance_after,
-                 status, _utcnow_iso(), trade_id),
+                 status, _utcnow_iso(), resolved_at, trade_id),
             )
             self._set_balance(c, balance_after)
 
