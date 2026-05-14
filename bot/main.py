@@ -1,8 +1,9 @@
 import logging
+import threading
 import time
 
 from .binance_client import get_klines, get_kline_by_open_time
-from .config import load_config
+from .config import load_configs
 from .database import Database
 from .martingale import next_bet
 from .polymarket_client import (
@@ -14,9 +15,7 @@ from .polymarket_resolver import wait_for_resolution
 from .strategy import predict_direction
 from .telegram_notifier import TelegramNotifier
 from .utils import (
-    current_window_ts,
     fmt_local,
-    fmt_ts,
     money,
     money_signed,
     sleep_until,
@@ -30,48 +29,95 @@ def _pretty_reason(reason: str) -> str:
     return " + ".join(p for p in reason.split("+") if p)
 
 
-def _next_entry(now: int, entry_lead: int) -> tuple[int, int]:
+_PILL_STATE_KEY = "last_pnl_msg_id"
+
+
+def _refresh_pnl_pill(db: "Database", notifier: "TelegramNotifier") -> None:
+    """Re-post the floating P&L button so it stays the latest message.
+
+    Sequence: read prior message_id from state, delete it (best-effort),
+    send a fresh single-button message with running balance + P&L + win
+    rate, store the new message_id. The button is a URL-link to this
+    bot's own chat, so tapping it is a silent no-op.
+
+    The displayed balance/P&L are "marked to worst case": any currently-open
+    trade's full cost is deducted up front, so the moment a trade opens you
+    see it reflected in the pill. On settle, a win reverses the deduction
+    and adds the payoff; a loss leaves the displayed number unchanged
+    (since we already showed the worst-case at open).
+    """
+    if not notifier.enabled or not notifier.username:
+        return
+    balance = db.get_balance()
+    stats = db.stats()
+    open_costs = sum(float(t["cost"]) for t in db.open_trades())
+    eff_balance = balance - open_costs
+    eff_pnl = stats["total_pnl"] - open_costs
+    win_rate = (stats["wins"] / stats["total"] * 100.0) if stats["total"] else 0.0
+    label = (
+        f"💰 {money(eff_balance)}   "
+        f"📈 {money_signed(eff_pnl)}   "
+        f"✓ {win_rate:.1f}%"
+    )
+    prior = db.get_state(_PILL_STATE_KEY)
+    if prior:
+        try:
+            notifier.delete_message(int(prior))
+        except ValueError:
+            pass
+    new_id = notifier.send_pnl_button("📊 Live P&L", label)
+    if new_id is not None:
+        db.set_state(_PILL_STATE_KEY, str(new_id))
+
+
+def _next_entry(now: int, entry_lead: int, phase: int) -> tuple[int, int]:
     """Pick the next *trade-eligible* 5-min boundary and the moment to enter.
 
-    The bot only trades windows aligned to 10-min boundaries (multiples of
-    600s) — i.e. :00, :10, :20, :30, :40, :50 — and skips the in-between
-    windows. This guarantees the previous trade has fully settled before we
-    size the next bet, so the martingale step is never stale.
+    A bot only trades windows whose unix-second start satisfies
+    ``(W - phase) % 600 == 0`` — i.e. with phase=0 it trades :00/:10/:20…
+    and with phase=300 it trades :05/:15/:25…. Either way each bot still
+    waits 10 min between its own trades, so the previous trade has fully
+    settled before sizing the next bet (martingale step is never stale).
 
-    Ideal entry is `entry_lead` seconds before the window starts. If we're
+    Ideal entry is ``entry_lead`` seconds before the window starts. If we're
     slightly late (within entry_lead seconds of window start) we enter
     immediately — still before the candle opens. If the window has already
-    begun (now >= W), we skip to the next 10-min boundary.
+    begun (now >= W), we skip to the next eligible boundary.
 
     Returns (target_window_ts, entry_time)."""
-    target = ((now // 600) + 1) * 600
+    # First W > now with (W - phase) % 600 == 0.
+    target = ((now - phase) // 600 + 1) * 600 + phase
     entry_time = max(now, target - entry_lead)
     return target, entry_time
 
 
-def _bootstrap_pending(cfg: dict, db: "Database", notifier: "TelegramNotifier", entry_lead: int) -> dict:
+def _bootstrap_pending(
+    cfg: dict,
+    db: "Database",
+    notifier: "TelegramNotifier",
+    entry_lead: int,
+    log: logging.LoggerAdapter,
+) -> dict:
     """Wait for the next live entry opportunity and open the first trade.
 
     Loops until a trade is successfully opened so the main pipeline always
     has a non-None `pending` to anchor its 10-min cadence on. If an attempt
     fails for any reason, we advance past that window before trying again
     instead of immediately retrying the same one."""
+    phase = int(cfg["phase_offset_seconds"])
     while True:
         now = int(time.time())
-        target, entry_time = _next_entry(now, entry_lead)
+        target, entry_time = _next_entry(now, entry_lead, phase)
         if int(time.time()) < entry_time:
-            logger.info(
+            log.info(
                 "Bootstrap: waiting for window %s (entry at %s)",
                 fmt_local(target),
                 fmt_local(entry_time),
             )
             sleep_until(entry_time)
-        pending = trade_open(cfg, db, notifier, target)
+        pending = trade_open(cfg, db, notifier, target, log)
         if pending is not None:
             return pending
-        # Failed — sleep past this window so the next iteration targets a
-        # different one (otherwise _next_entry would pick the same window
-        # again until its candle starts).
         sleep_until(target + 1)
 
 
@@ -104,7 +150,10 @@ def _settle_with_winner(
 
 
 def reconcile_open_trades(
-    cfg: dict, db: Database, notifier: TelegramNotifier
+    cfg: dict,
+    db: Database,
+    notifier: TelegramNotifier,
+    log: logging.LoggerAdapter,
 ) -> None:
     """For any orphan open trade whose 5-min window already closed, wait for
     Polymarket to declare a winner (no Binance fallback). Uses the same
@@ -112,7 +161,6 @@ def reconcile_open_trades(
     budget = int(cfg["resolution_budget_seconds"])
     for trade in db.open_trades():
         window_ts = int(trade["window_ts"])
-        # If the candle hasn't even closed yet, leave it alone for the main loop.
         if int(time.time()) < window_ts + 300:
             continue
         slug = trade["slug"]
@@ -137,7 +185,6 @@ def reconcile_open_trades(
             )
 
         winner = wait_for_resolution(slug, budget_s=budget, on_budget_exceeded=_overrun_msg)
-        # Best-effort: pull the Binance OHLC for display + audit on the row.
         candle = get_kline_by_open_time("BTCUSDT", "5m", window_ts * 1000)
         pnl, bal, won = _settle_with_winner(
             db, {**trade, "id": trade["id"]}, winner, candle
@@ -156,13 +203,17 @@ def reconcile_open_trades(
 
 
 def trade_open(
-    cfg: dict, db: Database, notifier: TelegramNotifier, window_ts: int
+    cfg: dict,
+    db: Database,
+    notifier: TelegramNotifier,
+    window_ts: int,
+    log: logging.LoggerAdapter,
 ) -> dict | None:
     """Enter a trade for the upcoming window. Returns trade-summary dict
     (id/window/side/shares/price/slug) used later for settlement, or None if
     the trade was skipped (already taken, insufficient balance, no data, …)."""
     if db.has_trade(window_ts):
-        logger.info("Window %s already traded, skipping entry", window_ts)
+        log.info("Window %s already traded, skipping entry", window_ts)
         return None
 
     next_window = window_ts + 300
@@ -170,12 +221,9 @@ def trade_open(
     candles = get_klines(
         symbol="BTCUSDT", interval="5m", limit=30, end_time_ms=window_ts * 1000 - 1
     )
-    # Strictly candles BEFORE the window we're betting on. The last item may
-    # be the still-running 5-min candle (closes at `window_ts`) - that's OK,
-    # it carries the freshest data and is ~99% complete at entry time.
     candles = [c for c in candles if c["open_time"] < window_ts * 1000]
     if len(candles) < 5:
-        logger.error("Insufficient candles for window %s: %d", window_ts, len(candles))
+        log.error("Insufficient candles for window %s: %d", window_ts, len(candles))
         return None
 
     direction, score, reason, regime = predict_direction(candles)
@@ -191,10 +239,6 @@ def trade_open(
     streak_type, streak_count = db.get_streak()
     bet = next_bet(streak_type, streak_count, cfg)
     shares = bet["shares"]
-    # Soft chop-no-double guard: don't double into a choppy market. The
-    # martingale step (and underlying streak) still advances on win/loss as
-    # normal, so doubling resumes the moment the regime flips back to trend.
-    # This caps the bleed at base × streak_length instead of base × 2^step.
     base_shares = int(cfg["base_shares"])
     clamped = regime == "chop" and bet["step"] >= 1 and shares > base_shares
     if clamped:
@@ -217,8 +261,6 @@ def trade_open(
         )
         return None
 
-    # Best estimate of the upcoming window's open: latest available price
-    # (close of the candle currently in progress, finalizing at `window_ts`).
     open_price_estimate = candles[-1]["close"]
 
     trade_id = db.open_trade(
@@ -287,7 +329,11 @@ def trade_open(
 
 
 def trade_settle(
-    cfg: dict, db: Database, notifier: TelegramNotifier, pending: dict
+    cfg: dict,
+    db: Database,
+    notifier: TelegramNotifier,
+    pending: dict,
+    log: logging.LoggerAdapter,
 ) -> bool:
     """Wait for Polymarket to resolve `pending`'s market and settle the trade.
 
@@ -314,8 +360,6 @@ def trade_settle(
 
     winner = wait_for_resolution(slug, budget_s=budget, on_budget_exceeded=_overrun_msg)
 
-    # Best-effort Binance close just for the Telegram display — does not
-    # affect win/lose, which comes solely from Polymarket.
     settled = get_kline_by_open_time("BTCUSDT", "5m", window_ts * 1000)
 
     trade_row = {
@@ -371,23 +415,48 @@ def trade_settle(
     return not overran["flag"]
 
 
-def main() -> None:
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
-    )
-    cfg = load_config()
+def _cadence_label(phase: int) -> str:
+    """Human description of which minute-of-hour slots this phase trades."""
+    base_minutes = [phase // 60 + 10 * i for i in range(6)]
+    base_minutes = [m % 60 for m in base_minutes]
+    return ", ".join(f":{m:02d}" for m in sorted(base_minutes))
+
+
+def _run_bot(cfg: dict, stop_event: threading.Event) -> None:
+    """One bot's full lifecycle. Runs in its own thread.
+
+    Each bot has its own DB file, its own Telegram credentials, and a phase
+    offset that determines which 5-min windows it trades. Two bots with
+    phases 0 and 300 cover every 5-min window between them while each
+    individually stays on a 10-min cadence.
+    """
+    name = cfg["name"]
+    log = logging.LoggerAdapter(logger, {})  # placeholder; real prefix below
+    # Use a per-bot logger so log lines get prefixed without polluting
+    # message strings.
+    log = _make_bot_logger(name)
+
     db = Database(cfg["db_path"], initial_balance=cfg["initial_balance"])
-    notifier = TelegramNotifier(cfg["telegram_bot_token"], cfg["telegram_chat_id"])
+    notifier = TelegramNotifier(
+        cfg["telegram_bot_token"], cfg["telegram_chat_id"]
+    )
+    # Every notifier.send() will now auto-refresh the P&L pill, so the pill
+    # is always the last message in the chat no matter which call site
+    # triggered the send (open/settle/reconcile/error/etc).
+    notifier.set_after_send_hook(lambda: _refresh_pnl_pill(db, notifier))
 
     entry_lead = int(cfg["entry_lead_seconds"])
     settle_buffer = int(cfg["settlement_buffer_seconds"])
     resolution_budget = int(cfg["resolution_budget_seconds"])
+    phase = int(cfg["phase_offset_seconds"])
 
     stats = db.stats()
     notifier.send(
         "\n".join([
             "🤖 Bot Started",
+            "",
+            f"Name: {name}",
+            f"DB:   {cfg['db_path']}",
             "",
             "💰 Account",
             f"Balance: {money(db.get_balance())}",
@@ -398,71 +467,55 @@ def main() -> None:
             f"Losses:  {stats['losses']}",
             f"Net P&L: {money_signed(stats['total_pnl'])}",
             "",
-            f"Cadence:    1 trade per 10 min (skips alternate 5-min windows)",
+            f"Cadence:    1 trade per 10 min on {_cadence_label(phase)}",
             f"Entry lead: {entry_lead}s before each window",
             f"Resolution: Polymarket only (budget {resolution_budget}s, skip on overrun)",
         ])
     )
 
     try:
-        reconcile_open_trades(cfg, db, notifier)
+        reconcile_open_trades(cfg, db, notifier, log)
     except Exception as e:
-        logger.exception("Reconcile failed: %s", e)
+        log.exception("Reconcile failed: %s", e)
 
-    # Sequential loop, one trade every 10 minutes. Each iteration:
-    #   1. Settle `pending` by waiting on Polymarket. Inside the soft
-    #      budget the next entry stays on schedule (W+600). On overrun,
-    #      we keep waiting indefinitely and the next entry slides to the
-    #      next free 10-min boundary after settlement.
-    #   2. Enter the next trade for that 10-min boundary.
-    pending: dict | None = _bootstrap_pending(cfg, db, notifier, entry_lead)
+    pending: dict | None = _bootstrap_pending(cfg, db, notifier, entry_lead, log)
 
-    while True:
+    while not stop_event.is_set():
         try:
             prev_window_ts = pending["window_ts"]
 
             settle_at = prev_window_ts + 300 + settle_buffer
             sleep_until(settle_at)
-            on_schedule = trade_settle(cfg, db, notifier, pending)
-            pending = None  # settled — don't re-settle on shutdown
+            if stop_event.is_set():
+                break
+            on_schedule = trade_settle(cfg, db, notifier, pending, log)
+            pending = None
 
             if on_schedule:
                 next_window = prev_window_ts + 600
                 next_entry_time = next_window - entry_lead
                 now = int(time.time())
                 if now >= next_window:
-                    # Lost the slot during settlement (unlikely but possible
-                    # with clock skew). Re-bootstrap to the next live boundary.
-                    pending = _bootstrap_pending(cfg, db, notifier, entry_lead)
+                    pending = _bootstrap_pending(cfg, db, notifier, entry_lead, log)
                     continue
                 if now < next_entry_time:
-                    logger.info(
+                    log.info(
                         "Waiting %ds for window %s (entry at %s)",
                         next_entry_time - now,
                         fmt_local(next_window),
                         fmt_local(next_entry_time),
                     )
                     sleep_until(next_entry_time)
-                pending = trade_open(cfg, db, notifier, next_window) or \
-                    _bootstrap_pending(cfg, db, notifier, entry_lead)
+                if stop_event.is_set():
+                    break
+                pending = trade_open(cfg, db, notifier, next_window, log) or \
+                    _bootstrap_pending(cfg, db, notifier, entry_lead, log)
             else:
-                # Settle overran the budget — skip whatever 10-min slot(s)
-                # passed while we waited, pick up at the next live boundary.
-                logger.info("Settle overran budget — resuming on next 10-min boundary")
-                pending = _bootstrap_pending(cfg, db, notifier, entry_lead)
+                log.info("Settle overran budget — resuming on next 10-min boundary")
+                pending = _bootstrap_pending(cfg, db, notifier, entry_lead, log)
 
-        except KeyboardInterrupt:
-            logger.info("Shutting down")
-            notifier.send(
-                "\n".join([
-                    "🛑 Bot Stopped",
-                    "",
-                    f"Balance: {money(db.get_balance())}",
-                ])
-            )
-            return
         except Exception as e:
-            logger.exception("Main loop error: %s", e)
+            log.exception("Main loop error: %s", e)
             try:
                 notifier.send(
                     "\n".join([
@@ -475,7 +528,62 @@ def main() -> None:
                 )
             except Exception:
                 pass
-            time.sleep(30)
+            # Sleep in 1s chunks so a stop_event lands quickly.
+            for _ in range(30):
+                if stop_event.is_set():
+                    break
+                time.sleep(1)
+
+    notifier.send(
+        "\n".join([
+            "🛑 Bot Stopped",
+            "",
+            f"Balance: {money(db.get_balance())}",
+        ])
+    )
+
+
+def _make_bot_logger(name: str) -> logging.LoggerAdapter:
+    """Per-bot LoggerAdapter that prefixes every record with [name]."""
+    class _Adapter(logging.LoggerAdapter):
+        def process(self, msg, kwargs):
+            return f"[{self.extra['name']}] {msg}", kwargs
+    return _Adapter(logger, {"name": name})
+
+
+def main() -> None:
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    )
+    configs = load_configs()
+    logger.info(
+        "Starting %d bot(s): %s",
+        len(configs),
+        ", ".join(c["name"] for c in configs),
+    )
+
+    stop_event = threading.Event()
+    threads: list[threading.Thread] = []
+    for cfg in configs:
+        t = threading.Thread(
+            target=_run_bot,
+            args=(cfg, stop_event),
+            name=f"bot-{cfg['name']}",
+            daemon=False,
+        )
+        t.start()
+        threads.append(t)
+
+    try:
+        while any(t.is_alive() for t in threads):
+            time.sleep(1)
+    except KeyboardInterrupt:
+        logger.info("Shutdown requested — signalling bots to stop")
+        stop_event.set()
+        for t in threads:
+            t.join(timeout=30)
+        logger.info("All bots stopped")
 
 
 if __name__ == "__main__":

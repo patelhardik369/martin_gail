@@ -12,22 +12,40 @@ adjusts the bet size, and posts the result to Telegram.
 It is **paper-only** today (no funded wallet, no real orders). State persists
 in SQLite so the bot can be restarted without losing balance/streak.
 
+## Architecture: two bots in parallel
+The project runs **two independent bots** in one process, one thread each.
+Together they cover every 5-min window; individually each still trades on a
+10-min cadence so its previous bet has settled before sizing the next.
+
+| Bot | Windows traded | DB file | Telegram env vars |
+|---|---|---|---|
+| **A** (phase 0)   | :00, :10, :20, :30, :40, :50 | `data/trades_a.db` | `TELEGRAM_BOT_TOKEN_A` / `TELEGRAM_CHAT_ID_A` |
+| **B** (phase 300) | :05, :15, :25, :35, :45, :55 | `data/trades_b.db` | `TELEGRAM_BOT_TOKEN_B` / `TELEGRAM_CHAT_ID_B` |
+
+Each bot has its own balance, streak, martingale state, and trade history —
+no shared mutable state between them. The bot list lives in `config.json`
+under `bots[]`; shared params (martingale, timing) sit at the top level and
+each bot inherits them. Spawned via `threading.Thread` from `bot.main.main()`;
+Ctrl+C sets a shared `stop_event` and both threads finish their current
+iteration then send a "Bot Stopped" Telegram message before exiting.
+
 ## How a single trade cycle works
-The bot trades **every other 5-min window** — one trade per 10 minutes,
-6 trades per hour. Trade windows are aligned to multiples of 600s, so the
-bot trades :00, :10, :20, :30, :40, :50 and **skips** :05, :15, :25, :35,
-:45, :55.
+Each bot trades windows aligned to its phase: `(W − phase) % 600 == 0`.
+For phase=0 that's :00/:10/:20/…; for phase=300 it's :05/:15/:25/….
+Both bots are 10 minutes between their *own* trades.
 
-This spacing is deliberate. With back-to-back 5-min trades, the bot would
-size bet N+1 ~10s before bet N's candle even closed — meaning bet N+1's
-martingale step would be based on a stale streak (bet N not yet settled).
-By skipping the in-between window, every new entry happens AFTER the
-previous trade has fully settled, so the martingale step is always based
-on a known win/loss outcome.
+This spacing is deliberate. With back-to-back 5-min trades inside a single
+bot, the bot would size bet N+1 ~10s before bet N's candle even closed —
+meaning bet N+1's martingale step would be based on a stale streak. By
+skipping the in-between window for each bot, every new entry happens AFTER
+that bot's previous trade has fully settled, so the martingale step is
+always based on a known win/loss outcome. (Bot B's in-between window is
+bot A's trade window, and vice versa — they don't share state, so neither
+pollutes the other's streak.)
 
-The loop is **sequential** (not pipelined): at any time at most one trade
-is open. Each iteration first settles the previous trade, then enters the
-next one in the 10-min slot.
+Each bot's loop is **sequential** (not pipelined): at any time at most one
+trade is open per bot. Each iteration first settles the previous trade,
+then enters the next one in that bot's next phase-aligned slot.
 
 For each trade window `W` (Unix-time multiple of 600):
 1. *(start of iteration: previous trade for window `W−600` is open)*
@@ -123,33 +141,39 @@ martin_gail/
 ├── CLAUDE.md                # This file
 ├── README.md                # Quick start
 ├── requirements.txt         # requests + python-dotenv + websocket-client
-├── config.example.json      # Strategy params
-├── .env.example             # TELEGRAM_BOT_TOKEN + TELEGRAM_CHAT_ID
+├── config.example.json      # Shared params + bots[] array
+├── .env.example             # 4 telegram vars (one pair per bot)
 ├── .gitignore
 ├── bot/
 │   ├── __init__.py
-│   ├── main.py              # Entry point, scheduler, trade cycle
-│   ├── config.py            # Load config.json + .env
+│   ├── main.py              # Entry point, thread per bot, scheduler, trade cycle
+│   ├── config.py            # Load config.json → list[bot_cfg]
 │   ├── utils.py             # window_ts, sleep_until, fmt_ts
 │   ├── binance_client.py    # Fetch 5-min klines (REST)
 │   ├── polymarket_client.py # Fetch event by slug, parse UP/DOWN prices, parse resolution
 │   ├── polymarket_resolver.py # Wait for winner via WS (primary) + HTTP (fallback)
-│   ├── strategy.py          # Trend analysis → UP/DOWN prediction
+│   ├── strategy.py          # Regime-aware UP/DOWN prediction with chop-invert
 │   ├── martingale.py        # Bet sizing
 │   ├── database.py          # SQLite: trades table + state KV
-│   └── telegram_notifier.py # send_message via HTTP
+│   └── telegram_notifier.py # send_message via HTTP, optional prefix
+├── scripts/
+│   ├── export_db.py
+│   └── backtest_new_strategy.py
 └── data/
-    └── trades.db            # Created on first run
+    ├── trades_a.db          # Bot A history (created on first run)
+    └── trades_b.db          # Bot B history (created on first run)
 ```
 
 ## Database schema
-- `trades` — one row per 5-min window. UNIQUE(window_ts) prevents duplicates
+Each bot has its own SQLite file (no `bot_id` column — physical isolation).
+- `trades` — one row per traded window. UNIQUE(window_ts) prevents duplicates
   on restart. Columns: `id, window_ts, slug, side, shares, price, cost,
-  open_price, close_price, actual_outcome, pnl, balance_after, bet_step,
-  score, reason, up_token_id, down_token_id, resolved_at, status
-  (open|won|lost), opened_at, closed_at`. `actual_outcome` is the
-  Polymarket-declared winner (`UP`/`DOWN`); `close_price` is the Binance
-  close at the same moment, kept for display/audit only.
+  open_price, window_high, window_low, close_price, actual_outcome, pnl,
+  balance_after, bet_step, score, reason, up_token_id, down_token_id,
+  resolved_at, status (open|won|lost), opened_at, closed_at`.
+  `actual_outcome` is the Polymarket-declared winner (`UP`/`DOWN`);
+  `close_price` is the Binance close at the same moment, kept for display
+  /audit only.
 - `state` — key/value KV. Today only `balance` lives here; streak is derived
   from the trades table (`get_streak` walks back from the latest resolved row).
 
@@ -158,12 +182,15 @@ martin_gail/
 pip install -r requirements.txt
 cp config.example.json config.json
 cp .env.example .env
-# Edit .env — paste your TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID
+# Edit .env — paste 4 vars: TELEGRAM_BOT_TOKEN_A/CHAT_ID_A and _B/_B
 python -m bot.main
 ```
 
-The bot starts, posts a "Bot started" summary to Telegram, waits for the next
-5-min boundary, and begins trading. Ctrl+C to stop — state is safe on disk.
+`bot.main.main()` loads `config.json`, spawns one thread per entry in `bots[]`,
+each with its own DB and Telegram credentials. Both bots post their own "Bot
+Started" summary, then wait for their next phase-aligned window. Ctrl+C is
+caught by the main thread, which sets a shared stop event; both bots finish
+their current iteration, send "Bot Stopped", and exit. State is safe on disk.
 
 ## Recovery on restart
 On startup `main.py` calls `reconcile_open_trades()` which finds any rows left

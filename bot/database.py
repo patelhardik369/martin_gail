@@ -93,6 +93,23 @@ class Database:
             (str(float(balance)),),
         )
 
+    # --- generic state KV --------------------------------------------------
+
+    def get_state(self, key: str) -> str | None:
+        with self._conn() as c:
+            row = c.execute(
+                "SELECT value FROM state WHERE key=?", (key,)
+            ).fetchone()
+        return row["value"] if row else None
+
+    def set_state(self, key: str, value: str) -> None:
+        with self._conn() as c:
+            c.execute(
+                "INSERT INTO state(key, value) VALUES(?, ?) "
+                "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                (key, value),
+            )
+
     # --- trades -----------------------------------------------------------
 
     def has_trade(self, window_ts: int) -> bool:

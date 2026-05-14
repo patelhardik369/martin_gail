@@ -3,8 +3,23 @@
   "base_shares": 5,
   "bet_multiplier": 2,
   "max_doubles": 6,
-  "db_path": "data/trades.db",
   "settlement_buffer_seconds": 5,
   "entry_lead_seconds": 10,
-  "resolution_budget_seconds": 240
+  "resolution_budget_seconds": 240,
+  "bots": [
+    {
+      "name": "A",
+      "db_path": "data/trades_a.db",
+      "phase_offset_seconds": 0,
+      "telegram_token_env": "TELEGRAM_BOT_TOKEN_A",
+      "telegram_chat_env": "TELEGRAM_CHAT_ID_A"
+    },
+    {
+      "name": "B",
+      "db_path": "data/trades_b.db",
+      "phase_offset_seconds": 300,
+      "telegram_token_env": "TELEGRAM_BOT_TOKEN_B",
+      "telegram_chat_env": "TELEGRAM_CHAT_ID_B"
+    }
+  ]
 }
