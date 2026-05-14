@@ -178,7 +178,7 @@ def trade_open(
         logger.error("Insufficient candles for window %s: %d", window_ts, len(candles))
         return None
 
-    direction, score, reason = predict_direction(candles)
+    direction, score, reason, regime = predict_direction(candles)
 
     slug = f"btc-updown-5m-{window_ts}"
     event = get_event_by_slug(slug)
@@ -191,6 +191,15 @@ def trade_open(
     streak_type, streak_count = db.get_streak()
     bet = next_bet(streak_type, streak_count, cfg)
     shares = bet["shares"]
+    # Soft chop-no-double guard: don't double into a choppy market. The
+    # martingale step (and underlying streak) still advances on win/loss as
+    # normal, so doubling resumes the moment the regime flips back to trend.
+    # This caps the bleed at base × streak_length instead of base × 2^step.
+    base_shares = int(cfg["base_shares"])
+    clamped = regime == "chop" and bet["step"] >= 1 and shares > base_shares
+    if clamped:
+        shares = base_shares
+        reason = f"{reason}+chop_no_double"
     cost = round(shares * price, 4)
 
     balance = db.get_balance()
@@ -227,6 +236,15 @@ def trade_open(
         down_token_id=down_token,
     )
 
+    martingale_lines = [
+        f"Step:   {bet['step']}",
+        f"Streak: {streak_label(streak_type, streak_count)}",
+    ]
+    if clamped:
+        martingale_lines.append(
+            f"⚠️ Chop detected — clamped to base ({base_shares}) instead of {bet['shares']}"
+        )
+
     notifier.send(
         "\n".join([
             f"🎯 Trade #{trade_id} — Opened",
@@ -245,12 +263,12 @@ def trade_open(
             f"Balance: {money(balance)}",
             "",
             "🎲 Signal",
+            f"Regime: {regime}",
             f"Score:  {score:+.1f}",
             f"Reason: {_pretty_reason(reason)}",
             "",
             "📈 Martingale",
-            f"Step:   {bet['step']}",
-            f"Streak: {streak_label(streak_type, streak_count)}",
+            *martingale_lines,
             "",
             "📍 Market",
             f"BTC now:            {money(open_price_estimate)}",
