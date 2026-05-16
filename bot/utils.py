@@ -1,7 +1,13 @@
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 WINDOW = 300  # seconds
+
+# All user-facing timestamps (Telegram messages, logs) are rendered in
+# Indian Standard Time so the operator (who is in India) doesn't have to
+# do mental conversion regardless of which timezone the VPS happens to
+# run in. Internal storage stays in UTC unix-seconds.
+IST = timezone(timedelta(hours=5, minutes=30))
 
 
 def current_window_ts(now: int | None = None) -> int:
@@ -30,13 +36,13 @@ def fmt_ts(ts: int) -> str:
 
 
 def fmt_local(ts: int) -> str:
-    """Full local datetime, e.g. '2026-05-11 18:20:00'."""
-    return datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M:%S")
+    """IST datetime in dd/mm/yy - hh:mm format, e.g. '11/05/26 - 18:20'."""
+    return datetime.fromtimestamp(ts, tz=IST).strftime("%d/%m/%y - %H:%M")
 
 
 def fmt_local_time(ts: int) -> str:
-    """Just the local time portion, e.g. '18:25:00'."""
-    return datetime.fromtimestamp(ts).strftime("%H:%M:%S")
+    """Just the IST time portion, e.g. '18:25'."""
+    return datetime.fromtimestamp(ts, tz=IST).strftime("%H:%M")
 
 
 def money(amount: float) -> str:
