@@ -248,7 +248,19 @@ def trade_open(
         log.error("Insufficient candles for window %s: %d", window_ts, len(candles))
         return None
 
-    direction, score, reason = predict_direction(candles)
+    # 1-hour candles for higher-timeframe trend context. 24h of history
+    # is enough to seed EMA(20) on the hourly. Best-effort — if the fetch
+    # fails the strategy still works with just the 5-min signals.
+    try:
+        candles_1h = get_klines(
+            symbol="BTCUSDT", interval="1h", limit=24, end_time_ms=window_ts * 1000 - 1
+        )
+        candles_1h = [c for c in candles_1h if c["open_time"] < window_ts * 1000]
+    except Exception as e:
+        log.warning("1h kline fetch failed (%s), proceeding with 5m only", e)
+        candles_1h = None
+
+    direction, score, reason = predict_direction(candles, candles_1h)
 
     slug = f"btc-updown-5m-{window_ts}"
     event = get_event_by_slug(slug)

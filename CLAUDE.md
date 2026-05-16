@@ -93,19 +93,38 @@ PnL per trade:
 - Loss: `−shares × entry_price`
 
 ## Strategy (next-candle direction)
-Inputs: last ~30 closed 5-min BTCUSDT candles (OHLCV from Binance public REST).
+Inputs:
+- Last ~30 closed 5-min BTCUSDT candles (OHLCV from Binance public REST).
+- Last 24 closed **1-hour** BTCUSDT candles (best-effort — strategy
+  degrades gracefully if the hourly fetch fails).
 
-Signal score (positive → UP, negative → DOWN, 0 → follow last candle):
+The 1-hour trend gets the dominant weight because 5-min direction is
+much closer to a random walk than 1-hour direction is. Aligning bets
+with the higher-timeframe trend is the single biggest edge available
+from public price data.
+
+Signal score (positive → UP, negative → DOWN, 0 → follow last 5-min candle):
+
 | Component | Weight | Notes |
 |---|---|---|
-| EMA(9) vs EMA(21) crossover | ±2 | Trend |
-| Sum of last-3 candle bodies | ±2 | Short-term momentum |
-| Last candle body color | ±1 | Continuation |
-| Volume surge (last vol > 1.5× 20-period avg) | ±1 | Amplifies last-candle direction |
-| Long wick reversal (wick > 2× body) | ±0.5 | Lower → bullish, upper → bearish |
+| **1h EMA(8) vs EMA(20) trend** | **±3** | Dominant signal. Requires 0.10% gap so micro-crossings don't flip. |
+| 5-min EMA(9) vs EMA(21) crossover | ±2 | Short-term trend |
+| Sum of last-4 candle bodies | ±2 | Short-term momentum (extended from 3) |
+| Last 5-min candle body, weighted by body/range | up to ±1 | Doji-like → ~0; strong-body candle → full ±1 |
+| Volume surge (last vol > 1.5× 20-period avg) | ±2 | Confirmation (raised from 1) |
+| Long wick reversal (wick > 2× body) | ±1 | Lower → bullish, upper → bearish (raised from 0.5) |
+| RSI(14) extreme zones | ±0.5 | <30 → +0.5 (oversold bounce), >70 → −0.5 (overbought reversion) |
 
-Tunable in `bot/strategy.py`. Doesn't try to be clever — keeps the bot
-deterministic and easy to reason about.
+Low-range guard: when the last 5-min candle's range is below 50% of
+ATR(20), the last-candle-color and volume-surge components are
+suppressed entirely — a volume spike on a tiny candle is noise.
+
+Max score range is roughly ±11.5, so conviction is visible (a +9 score
+means most components aligned bullish, +2 is a soft lean).
+
+Tunable in `bot/strategy.py` — weights and thresholds are module
+constants at the top of the file. Keeps the bot deterministic and easy
+to reason about.
 
 ## Bet sizing (martingale)
 - `base_shares` (default 5) on a fresh start / right after a win.
@@ -152,13 +171,12 @@ martin_gail/
 │   ├── binance_client.py    # Fetch 5-min klines (REST)
 │   ├── polymarket_client.py # Fetch event by slug, parse UP/DOWN prices, parse resolution
 │   ├── polymarket_resolver.py # Wait for winner via WS (primary) + HTTP (fallback)
-│   ├── strategy.py          # Trend-following UP/DOWN prediction
+│   ├── strategy.py          # Multi-timeframe UP/DOWN prediction (5m + 1h)
 │   ├── martingale.py        # Bet sizing
 │   ├── database.py          # SQLite: trades table + state KV
 │   └── telegram_notifier.py # send_message via HTTP, optional prefix
 ├── scripts/
 │   ├── export_db.py
-│   └── backtest_new_strategy.py
 └── data/
     ├── trades_a.db          # Bot A history (created on first run)
     └── trades_b.db          # Bot B history (created on first run)
