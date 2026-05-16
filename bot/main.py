@@ -61,17 +61,30 @@ def _refresh_pnl_pill(db: "Database", notifier: "TelegramNotifier") -> None:
     eff_pnl = stats["total_pnl"] - open_costs
     win_rate = (stats["wins"] / stats["total"] * 100.0) if stats["total"] else 0.0
 
-    last10 = db.get_last_n_results(10)
-    last10_strip = " ".join("✅" if r == "won" else "❌" for r in last10) or "(none yet)"
-    w10 = sum(1 for r in last10 if r == "won")
-    l10 = len(last10) - w10
+    all_results = db.get_all_results()
+    total = len(all_results)
+    wins_n = sum(1 for r in all_results if r == "won")
+    losses_n = total - wins_n
+    # Group 20 emojis per row so the strip stays readable on mobile.
+    # Telegram message hard limit is 4096 chars. Cap the strip at the most
+    # recent _MAX_PILL_RESULTS so headers/streak rows stay safely in budget;
+    # at 6 trades/hr per bot that's >10 days before we start truncating.
+    _MAX_PILL_RESULTS = 1500
+    shown = all_results[-_MAX_PILL_RESULTS:]
+    truncated = total - len(shown)
+    emojis = ["✅" if r == "won" else "❌" for r in shown]
+    rows = [" ".join(emojis[i:i + 20]) for i in range(0, len(emojis), 20)]
+    if truncated:
+        rows.insert(0, f"(+ {truncated} older not shown)")
+    strip = "\n".join(rows) if rows else "(none yet)"
 
     sd = db.get_streak_distribution()
 
     body = "\n".join([
         "📊 Live Stats",
         "",
-        f"Last 10:  {last10_strip}   ({w10}W / {l10}L)",
+        f"All results ({total} trades, {wins_n}W / {losses_n}L):",
+        strip,
         "",
         f"Win streaks:   {_fmt_streak_dist(sd['won'])}",
         f"Loss streaks:  {_fmt_streak_dist(sd['lost'])}",

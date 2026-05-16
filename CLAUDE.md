@@ -239,3 +239,56 @@ dispute), the bot keeps waiting and announces the delay on Telegram.
   `websocket-client`) and avoids version churn.
 - Floats for money are fine at this scale; everything is rounded to 4 dp at
   the storage boundary.
+
+## Decisions log
+A running record of major design calls — what we decided, why, what's
+expected to come next. Newest entry on top. Add a new section every time
+a non-trivial choice is made; cite a date/time and the commit that
+captures the change (if any).
+
+### 2026-05-16 17:49 IST — Hold on adding any low-conviction sizing clamp
+**Context:** Just shipped the multi-timeframe strategy (commit `f0f9f7e`)
+— 1h trend (±3), RSI extremes, body-weighted last-candle, low-range
+guard, raised volume/wick weights. Max score now ≈ ±11.5 vs ±6.5 before.
+
+**External advice received:** "Add a clamp at sizing time — if `|score|
+< 2.0`, force step=0 (bet base) for this trade only, don't change
+streak counter. One line, zero martingale changes, prevents blow-ups."
+
+**Decision: NOT implementing the clamp right now.** Reasons:
+1. **It's the same mechanism we already reverted.** The chop-no-double
+   clamp removed in commit `0a8e73d` had identical structure — different
+   trigger (regime tag) but same action (clamp shares to base when
+   uncertain mid-streak). Data showed it killed recovery wins more than
+   it saved on losses.
+2. **The proposed trigger doesn't catch the real failure mode.** Looking
+   at Bot B's recent 7-loss streak (the one that drove balance negative):
+   the dangerous middle trades had `|score|` ∈ {5.5, 6.0, 3.0, 3.0, 2.5}
+   — all above the 2.0 threshold. The clamp would have fired only on
+   trades 1 and 7 (base-step bets anyway), saving nothing. It would NOT
+   prevent the blow-up.
+3. **EV math:** clamping at deep step is only positive when win rate at
+   low |score| is **below 50%**. We don't have data on the new strategy
+   yet — could be 45% (clamp helps) or 55% (clamp hurts). Implementing
+   blind is a coin-flip on whether it improves things.
+
+**Plan (to revisit ~2026-05-18):**
+1. Let the new strategy run live for 24–48 hours.
+2. Pull both DBs, query:
+   - Win rate by 1h regime tag (`1h_bull` / `1h_bear` / `1h_flat`).
+     If `1h_flat` is >25% of trades and has notably lower win rate,
+     the 0.10% gap threshold (`TF_1H_GAP_PCT` in strategy.py) is
+     probably too tight or too loose.
+   - Win rate by score bucket (`|score|` 0-2, 2-4, 4+). If low |score|
+     is <50% win rate AND those trades cluster at step ≥ 2, the clamp
+     becomes worth implementing.
+   - Position in streak where deep losses occurred — confirm whether
+     they were high-|score| (no clamp will help) or low-|score|
+     (clamp would have helped).
+3. Decide based on the data, not on intuition.
+
+**Operator's standing constraint (do not violate without explicit OK):**
+Martingale steps must not be reduced. `max_doubles=6`, full doubling
+chain (`5→10→20→40→80→160→320`). The pure-martingale revert in commit
+`0a8e73d` was deliberate — any future clamp/skip logic should be
+opt-in, well-justified by data, and easy to revert.

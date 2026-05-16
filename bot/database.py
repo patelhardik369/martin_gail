@@ -256,6 +256,16 @@ class Database:
             ).fetchall()
         return [r["status"] for r in reversed(rows)]
 
+    def get_all_results(self) -> list[str]:
+        """Return every resolved trade's status in chronological order
+        (oldest first). Used by the live-stats Telegram pill."""
+        with self._conn() as c:
+            rows = c.execute(
+                "SELECT status FROM trades WHERE status IN ('won','lost') "
+                "ORDER BY id"
+            ).fetchall()
+        return [r["status"] for r in rows]
+
     def stats(self) -> dict:
         with self._conn() as c:
             row = c.execute(
