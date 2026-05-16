@@ -12,8 +12,9 @@ its previous bet has settled before sizing the next).
 | B | :05, :15, :25, :35, :45, :55 | `data/trades_b.db` |
 
 Each bot has its own balance, streak, martingale state, and Telegram channel.
-Strategy is regime-aware: a chop detector inverts the side and clamps bet
-size when the market is whipsawing (see `bot/strategy.py`).
+Strategy is a simple trend-follower combining EMA cross, last-3 momentum,
+last-candle color, volume surge, and wick reversal into a signed score
+(see `bot/strategy.py`).
 
 > Paper trading only. No funds at risk. See `CLAUDE.md` for the full design.
 

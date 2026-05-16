@@ -152,7 +152,7 @@ martin_gail/
 │   ├── binance_client.py    # Fetch 5-min klines (REST)
 │   ├── polymarket_client.py # Fetch event by slug, parse UP/DOWN prices, parse resolution
 │   ├── polymarket_resolver.py # Wait for winner via WS (primary) + HTTP (fallback)
-│   ├── strategy.py          # Regime-aware UP/DOWN prediction with chop-invert
+│   ├── strategy.py          # Trend-following UP/DOWN prediction
 │   ├── martingale.py        # Bet sizing
 │   ├── database.py          # SQLite: trades table + state KV
 │   └── telegram_notifier.py # send_message via HTTP, optional prefix
