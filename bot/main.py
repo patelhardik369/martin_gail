@@ -32,19 +32,25 @@ def _pretty_reason(reason: str) -> str:
 _PILL_STATE_KEY = "last_pnl_msg_id"
 
 
+def _fmt_streak_dist(d: dict[int, int]) -> str:
+    """Render '{1: 27, 2: 16, ...}' as '1×27  2×16  3×9  ...' sorted by length."""
+    if not d:
+        return "(none)"
+    return "  ".join(f"{L}×{d[L]}" for L in sorted(d.keys()))
+
+
 def _refresh_pnl_pill(db: "Database", notifier: "TelegramNotifier") -> None:
-    """Re-post the floating P&L button so it stays the latest message.
+    """Re-post the floating Live-Stats button so it stays the latest message.
 
-    Sequence: read prior message_id from state, delete it (best-effort),
-    send a fresh single-button message with running balance + P&L + win
-    rate, store the new message_id. The button is a URL-link to this
-    bot's own chat, so tapping it is a silent no-op.
+    The body now shows the last 10 trade results and the full distribution
+    of win/loss streak lengths, with the running balance + P&L + win rate
+    on a single inline-keyboard button below. The button's URL points at
+    this bot's own chat so taps are silent no-ops.
 
-    The displayed balance/P&L are "marked to worst case": any currently-open
+    Displayed balance/P&L are "marked to worst case": any currently-open
     trade's full cost is deducted up front, so the moment a trade opens you
-    see it reflected in the pill. On settle, a win reverses the deduction
-    and adds the payoff; a loss leaves the displayed number unchanged
-    (since we already showed the worst-case at open).
+    see it reflected. On settle, a win reverses the deduction and adds the
+    payoff; a loss leaves the displayed number unchanged.
     """
     if not notifier.enabled or not notifier.username:
         return
@@ -54,6 +60,22 @@ def _refresh_pnl_pill(db: "Database", notifier: "TelegramNotifier") -> None:
     eff_balance = balance - open_costs
     eff_pnl = stats["total_pnl"] - open_costs
     win_rate = (stats["wins"] / stats["total"] * 100.0) if stats["total"] else 0.0
+
+    last10 = db.get_last_n_results(10)
+    last10_strip = " ".join("✅" if r == "won" else "❌" for r in last10) or "(none yet)"
+    w10 = sum(1 for r in last10 if r == "won")
+    l10 = len(last10) - w10
+
+    sd = db.get_streak_distribution()
+
+    body = "\n".join([
+        "📊 Live Stats",
+        "",
+        f"Last 10:  {last10_strip}   ({w10}W / {l10}L)",
+        "",
+        f"Win streaks:   {_fmt_streak_dist(sd['won'])}",
+        f"Loss streaks:  {_fmt_streak_dist(sd['lost'])}",
+    ])
     label = (
         f"💰 {money(eff_balance)}   "
         f"📈 {money_signed(eff_pnl)}   "
@@ -65,7 +87,7 @@ def _refresh_pnl_pill(db: "Database", notifier: "TelegramNotifier") -> None:
             notifier.delete_message(int(prior))
         except ValueError:
             pass
-    new_id = notifier.send_pnl_button("📊 Live P&L", label)
+    new_id = notifier.send_pnl_button(body, label)
     if new_id is not None:
         db.set_state(_PILL_STATE_KEY, str(new_id))
 

@@ -219,6 +219,43 @@ class Database:
                 break
         return ("win" if first == "won" else "loss", count)
 
+    def get_streak_distribution(self) -> dict[str, dict[int, int]]:
+        """Walk the whole resolved-trade history and count consecutive runs.
+
+        Returns ``{'won': {length: count}, 'lost': {length: count}}`` — e.g.
+        ``{'won': {1: 26, 2: 20, 3: 12, ...}, 'lost': {1: 27, ...}}`` meaning
+        26 single wins, 20 back-to-back wins, etc.
+        """
+        with self._conn() as c:
+            rows = c.execute(
+                "SELECT status FROM trades WHERE status IN ('won','lost') ORDER BY id"
+            ).fetchall()
+        wins: dict[int, int] = {}
+        losses: dict[int, int] = {}
+        if not rows:
+            return {"won": wins, "lost": losses}
+        cur = rows[0]["status"]; n = 1
+        for r in rows[1:]:
+            if r["status"] == cur:
+                n += 1
+            else:
+                target = wins if cur == "won" else losses
+                target[n] = target.get(n, 0) + 1
+                cur = r["status"]; n = 1
+        target = wins if cur == "won" else losses
+        target[n] = target.get(n, 0) + 1
+        return {"won": wins, "lost": losses}
+
+    def get_last_n_results(self, n: int) -> list[str]:
+        """Return the last ``n`` resolved trade statuses, oldest first."""
+        with self._conn() as c:
+            rows = c.execute(
+                "SELECT status FROM trades WHERE status IN ('won','lost') "
+                "ORDER BY id DESC LIMIT ?",
+                (n,),
+            ).fetchall()
+        return [r["status"] for r in reversed(rows)]
+
     def stats(self) -> dict:
         with self._conn() as c:
             row = c.execute(
